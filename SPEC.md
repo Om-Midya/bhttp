@@ -103,7 +103,7 @@ If the frame is malformed, the server answers 400. A frame is malformed in each 
 - Text is not valid UTF-8.
 - Method is unknown.
 
-Length already delimited the bad frame, so the stream is still in sync. The server keeps the connection open after a 400. If the connection ends in the middle of a frame, the server closes it without a reply.
+Length already delimited the bad frame, so the stream is still in sync. The server keeps the connection open after a 400. If the connection ends in the middle of a frame, the server closes it without a reply. The server also closes a connection that sends nothing for 30 seconds.
 
 For HEAD the server sends the same RESPONSE as for GET, with END set and no DATA frames.
 
