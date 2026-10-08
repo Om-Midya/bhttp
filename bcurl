@@ -116,7 +116,7 @@ def main():
                 if args.verbose:
                     print("< status %d" % status, file=sys.stderr)
                     for name, value in rhdrs:
-                        print("< %s: %s" % (name, value), file=sys.stderr)
+                        print("< %s: %s" % (B.printable(name), B.printable(value)), file=sys.stderr)
                 sys.stdout.buffer.write(body)
                 sys.stdout.buffer.flush()
                 if status >= 400:

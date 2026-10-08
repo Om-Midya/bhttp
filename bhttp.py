@@ -174,6 +174,11 @@ def decode_response(payload):
 
 # --- debugging --------------------------------------------------------------
 
+def printable(text):
+    """Escape control characters so peer-supplied text is safe to print to a terminal."""
+    return "".join(ch if ch.isprintable() or ch == " " else "\\x%02x" % ord(ch) for ch in text)
+
+
 def hexdump(data):
     lines = []
     for off in range(0, len(data), 16):

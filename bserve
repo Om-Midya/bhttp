@@ -7,6 +7,7 @@ Serves files under ROOT.  One connection carries any number of requests.
 Logs one line per request to stdout.
 """
 import email.utils
+import io
 import mimetypes
 import os
 import socketserver
@@ -17,6 +18,7 @@ import bhttp as B  # noqa: E402
 
 SERVER = "bserve/1"
 CHUNK = 16384          # body bytes per DATA frame; HTTP/2 uses the same default
+IDLE_TIMEOUT = 30
 
 
 def log(*parts):
@@ -34,12 +36,14 @@ def resolve(root, path):
 
 
 class Handler(socketserver.StreamRequestHandler):
+    timeout = IDLE_TIMEOUT      # seconds a connection can sit idle between frames
+
     def handle(self):
         peer = "%s:%d" % self.client_address[:2]
         while True:
             try:
                 frame = B.read_frame(self.rfile)
-            except EOFError as e:
+            except (EOFError, OSError) as e:   # truncated frame, idle timeout, or reset
                 log(peer, "close:", e)
                 return
             if frame is None:                     # clean EOF at a frame boundary
@@ -57,38 +61,48 @@ class Handler(socketserver.StreamRequestHandler):
                     raise B.Malformed("unknown method 0x%02x" % method)
             except B.Malformed as e:
                 log(peer, "#%d 400 %s" % (frame.rid, e))
-                self.reply(frame.rid, 400, [("reason", str(e))], b"400 Bad Request\n", False)
+                self.reply(frame.rid, 400, [("reason", str(e))], io.BytesIO(b"400 Bad Request\n"), 16, False)
                 continue
-            status, headers, body = self.serve(path)
-            log(peer, "#%d %s %s -> %d %dB" % (frame.rid, B.METHOD_NAMES[method], path, status, len(body)))
-            self.reply(frame.rid, status, headers, body, method == B.M_HEAD)
+            status, headers, body, size = self.serve(path)
+            log(peer, "#%d %s %s -> %d %dB" % (frame.rid, B.METHOD_NAMES[method], B.printable(path), status, size))
+            try:
+                with body:
+                    self.reply(frame.rid, status, headers, body, size, method == B.M_HEAD)
+            except OSError as e:
+                log(peer, "close:", e)
+                return
 
     def serve(self, path):
+        """Returns (status, headers, body file object, body size).  The caller closes the body."""
         full = resolve(self.server.root, path)
         if full is None:
-            return 404, [("reason", "no such file")], b"404 Not Found\n"
+            return 404, [("reason", "no such file")], io.BytesIO(b"404 Not Found\n"), 14
         try:
-            with open(full, "rb") as f:
-                body = f.read()   # ponytail: whole file in memory; stream CHUNK reads if files outgrow RAM
-            st = os.stat(full)
+            f = open(full, "rb")
+            st = os.fstat(f.fileno())
         except OSError as e:
-            return 500, [("reason", e.strerror or "read error")], b"500 Internal Server Error\n"
+            return 500, [("reason", e.strerror or "read error")], io.BytesIO(b"500 Internal Server Error\n"), 26
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         return 200, [
             ("content-type", ctype),
             ("last-modified", email.utils.formatdate(st.st_mtime, usegmt=True)),
             ("etag", '"%x-%x"' % (st.st_mtime_ns, st.st_size)),
-        ], body
+        ], f, st.st_size
 
-    def reply(self, rid, status, headers, body, head_only):
+    def reply(self, rid, status, headers, body, size, head_only):
         headers = [("server", SERVER),
                    ("date", email.utils.formatdate(usegmt=True)),
-                   ("content-length", str(len(body)))] + headers
-        chunks = [] if head_only else [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
-        out = B.Frame(B.T_RESPONSE, 0 if chunks else B.F_END, rid, B.encode_response(status, headers)).pack()
-        for i, chunk in enumerate(chunks):
-            out += B.Frame(B.T_DATA, B.F_END if i == len(chunks) - 1 else 0, rid, chunk).pack()
-        self.wfile.write(out)
+                   ("content-length", str(size))] + headers
+        has_body = size > 0 and not head_only
+        self.wfile.write(B.Frame(B.T_RESPONSE, 0 if has_body else B.F_END, rid,
+                                 B.encode_response(status, headers)).pack())
+        sent = 0
+        while has_body and sent < size:            # stream CHUNK bytes at a time; never holds the whole file
+            chunk = body.read(min(CHUNK, size - sent))
+            if not chunk:
+                raise OSError("file shrank while sending")
+            sent += len(chunk)
+            self.wfile.write(B.Frame(B.T_DATA, B.F_END if sent == size else 0, rid, chunk).pack())
         self.wfile.flush()
 
 
