@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""bcurl: bhttp/1 client.
+
+    ./bcurl [-v] [-I] [-H NAME:VALUE]... [--probe] HOST[:PORT]/PATH [/PATH ...]
+
+Opens exactly one TCP connection and sends every path on it, in order.
+Body goes to stdout.  -v hexdumps every frame, both directions, to stderr.
+Exit status: 0 on 2xx, 4 on 4xx, 5 on 5xx, 2 on a protocol or connection error.
+"""
+import argparse
+import os
+import socket
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bhttp as B  # noqa: E402
+
+USER_AGENT = "bcurl/1"
+DEFAULT_PORT = 9000
+
+
+def parse_url(url):
+    url = url.removeprefix("bhttp://")
+    hostport, _, path = url.partition("/")
+    host, _, port = hostport.partition(":")
+    if not host:
+        sys.exit("bcurl: bad url %r" % url)
+    return host, int(port or DEFAULT_PORT), "/" + path
+
+
+class Client:
+    def __init__(self, sock, verbose):
+        self.sock, self.verbose = sock, verbose
+        self.rfile = sock.makefile("rb")
+
+    def dump(self, arrow, frame):
+        if not self.verbose:
+            return
+        raw = frame.pack()
+        print(arrow, frame.describe(), file=sys.stderr)
+        for line in B.hexdump(raw).splitlines():
+            print(arrow, line, file=sys.stderr)
+
+    def send(self, frame):
+        self.dump(">", frame)
+        self.sock.sendall(frame.pack())
+
+    def recv_known(self):
+        """Next frame of a known type.  Unknown types are hexdumped and skipped."""
+        while True:
+            frame = B.read_frame(self.rfile)
+            if frame is None:
+                raise EOFError("server closed the connection")
+            self.dump("<", frame)
+            if frame.type == 0:
+                raise B.Malformed("reserved frame type 0")
+            if frame.type in B.KNOWN_TYPES:
+                return frame
+            if self.verbose:
+                print("< (unknown type, skipped)", file=sys.stderr)
+
+    def fetch(self, rid, method, path, headers):
+        """Send one request and return (status, headers, body)."""
+        self.send(B.Frame(B.T_REQUEST, B.F_END, rid, B.encode_request(method, path, headers)))
+        frame = self.recv_known()
+        if frame.type != B.T_RESPONSE or frame.rid != rid:
+            raise B.Malformed("expected RESPONSE id=%d, got %s" % (rid, frame.describe()))
+        status, rhdrs = B.decode_response(frame.payload)
+        body = bytearray()
+        while not frame.flags & B.F_END:
+            frame = self.recv_known()
+            if frame.type != B.T_DATA or frame.rid != rid:
+                raise B.Malformed("expected DATA id=%d, got %s" % (rid, frame.describe()))
+            body += frame.payload
+        return status, rhdrs, bytes(body)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bcurl", add_help=True)
+    ap.add_argument("-v", "--verbose", action="store_true", help="hexdump every frame to stderr")
+    ap.add_argument("-I", "--head", action="store_true", help="send HEAD instead of GET")
+    ap.add_argument("-H", "--header", action="append", default=[], metavar="NAME:VALUE",
+                    help="extra request header (repeatable)")
+    ap.add_argument("--probe", action="store_true",
+                    help="send an unknown frame type (0x7f) first; the server must skip it")
+    ap.add_argument("url", help="HOST[:PORT]/PATH")
+    ap.add_argument("paths", nargs="*", help="more paths, fetched on the same connection")
+    args = ap.parse_args()
+
+    host, port, first = parse_url(args.url)
+    paths = [first] + ["/" + p.lstrip("/") for p in args.paths]
+    method = B.M_HEAD if args.head else B.M_GET
+    extra = []
+    for h in args.header:
+        name, sep, value = h.partition(":")
+        if not sep or not name.strip():
+            sys.exit("bcurl: bad header %r, want NAME:VALUE" % h)
+        extra.append((name.strip(), value.strip()))
+    headers = [("host", "%s:%d" % (host, port)), ("user-agent", USER_AGENT),
+               ("accept", "*/*"), ("accept-encoding", "identity")] + extra
+
+    try:
+        sock = socket.create_connection((host, port))
+    except OSError as e:
+        print("bcurl: connect %s:%d: %s" % (host, port, e), file=sys.stderr)
+        sys.exit(2)
+
+    exit_code = 0
+    with sock:
+        c = Client(sock, args.verbose)
+        if args.probe:
+            c.send(B.Frame(0x7F, 0, 0, b"probe"))
+        try:
+            for rid, path in enumerate(paths, 1):
+                status, rhdrs, body = c.fetch(rid, method, path, headers)
+                if args.verbose:
+                    print("< status %d" % status, file=sys.stderr)
+                    for name, value in rhdrs:
+                        print("< %s: %s" % (name, value), file=sys.stderr)
+                sys.stdout.buffer.write(body)
+                sys.stdout.buffer.flush()
+                if status >= 400:
+                    exit_code = status // 100
+        except (B.Malformed, EOFError, OSError) as e:
+            print("bcurl: %s" % e, file=sys.stderr)
+            exit_code = 2
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
