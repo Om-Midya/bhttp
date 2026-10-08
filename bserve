@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""bserve: bhttp/1 static file server.
+
+    ./bserve ROOT PORT
+
+Serves files under ROOT.  One connection carries any number of requests.
+Logs one line per request to stdout.
+"""
+import email.utils
+import mimetypes
+import os
+import socketserver
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bhttp as B  # noqa: E402
+
+SERVER = "bserve/1"
+CHUNK = 16384          # body bytes per DATA frame; HTTP/2 uses the same default
+
+
+def log(*parts):
+    print(*parts, flush=True)
+
+
+def resolve(root, path):
+    """Map a request path to a file under root.  Returns None if there is no file."""
+    if path.endswith("/"):
+        path += "index.html"
+    full = os.path.realpath(os.path.join(root, path.lstrip("/")))
+    if not full.startswith(root + os.sep):     # escaped the root via '..' or a symlink
+        return None
+    return full if os.path.isfile(full) else None
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        peer = "%s:%d" % self.client_address[:2]
+        while True:
+            try:
+                frame = B.read_frame(self.rfile)
+            except EOFError as e:
+                log(peer, "close:", e)
+                return
+            if frame is None:                     # clean EOF at a frame boundary
+                return
+            if frame.type != 0 and frame.type not in B.KNOWN_TYPES:
+                log(peer, "skip", frame.describe())
+                continue
+            try:
+                if frame.type != B.T_REQUEST:
+                    raise B.Malformed("unexpected frame type 0x%02x" % frame.type)
+                if frame.rid == 0:
+                    raise B.Malformed("request id 0 is reserved")
+                method, path, _ = B.decode_request(frame.payload)
+                if method not in B.METHOD_NAMES:
+                    raise B.Malformed("unknown method 0x%02x" % method)
+            except B.Malformed as e:
+                log(peer, "#%d 400 %s" % (frame.rid, e))
+                self.reply(frame.rid, 400, [("reason", str(e))], b"400 Bad Request\n", False)
+                continue
+            status, headers, body = self.serve(path)
+            log(peer, "#%d %s %s -> %d %dB" % (frame.rid, B.METHOD_NAMES[method], path, status, len(body)))
+            self.reply(frame.rid, status, headers, body, method == B.M_HEAD)
+
+    def serve(self, path):
+        full = resolve(self.server.root, path)
+        if full is None:
+            return 404, [("reason", "no such file")], b"404 Not Found\n"
+        try:
+            with open(full, "rb") as f:
+                body = f.read()   # ponytail: whole file in memory; stream CHUNK reads if files outgrow RAM
+            st = os.stat(full)
+        except OSError as e:
+            return 500, [("reason", e.strerror or "read error")], b"500 Internal Server Error\n"
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        return 200, [
+            ("content-type", ctype),
+            ("last-modified", email.utils.formatdate(st.st_mtime, usegmt=True)),
+            ("etag", '"%x-%x"' % (st.st_mtime_ns, st.st_size)),
+        ], body
+
+    def reply(self, rid, status, headers, body, head_only):
+        headers = [("server", SERVER),
+                   ("date", email.utils.formatdate(usegmt=True)),
+                   ("content-length", str(len(body)))] + headers
+        chunks = [] if head_only else [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
+        out = B.Frame(B.T_RESPONSE, 0 if chunks else B.F_END, rid, B.encode_response(status, headers)).pack()
+        for i, chunk in enumerate(chunks):
+            out += B.Frame(B.T_DATA, B.F_END if i == len(chunks) - 1 else 0, rid, chunk).pack()
+        self.wfile.write(out)
+        self.wfile.flush()
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.exit("usage: bserve ROOT PORT")
+    root = os.path.realpath(argv[1])
+    if not os.path.isdir(root):
+        sys.exit("bserve: %s is not a directory" % argv[1])
+    with Server(("", int(argv[2])), Handler) as srv:
+        srv.root = root
+        log("bserve: serving %s on port %d" % (root, srv.server_address[1]))
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main(sys.argv)
